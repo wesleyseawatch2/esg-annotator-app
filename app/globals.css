@@ -365,3 +365,27 @@ body {
     color:#b91c1c; 
     font-weight: 600; 
 }
+
+/* 在您的 app/globals.css 或其他主要 CSS 檔案中加入 */
+.btn-emerald {
+  background-color: #059669; /* Emerald Green */
+  color: white;
+  padding: 10px 20px;
+  border-radius: 5px;
+  font-size: 1.1rem;
+  font-weight: bold;
+  border: none;
+  cursor: pointer;
+  transition: background-color 0.2s ease;
+  box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+}
+
+.btn-emerald:hover:not(:disabled) {
+  background-color: #047857;
+}
+
+.btn-emerald:disabled {
+  background-color: #a7f3d0; /* 淡綠色，表示禁用 */
+  cursor: not-allowed;
+  box-shadow: none;
+}

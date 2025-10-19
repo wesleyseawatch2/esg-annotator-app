@@ -234,7 +234,13 @@ function AnnotationScreen({ user, project, onBack }) {
                 <div className="progress">
                     <span>您的個人進度: {progress.completed} / {progress.total}</span>
                     <div className="nav-btns">
-                        <button className="nav-btn btn-success" onClick={handleSaveAndNext} disabled={!currentItem}>儲存 & 下一筆</button>
+                        <button 
+                            className="nav-btn btn-emerald" // 將 btn-success 改為 btn-emerald
+                            onClick={handleSaveAndNext} 
+                            disabled={!currentItem}
+                        >
+                            儲存 & 下一筆
+                        </button>
                     </div>
                 </div>
             </div>

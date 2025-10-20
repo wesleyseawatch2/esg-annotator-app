@@ -17,7 +17,6 @@ async function main() {
 
   const allFiles = fs.readdirSync(dataFolderPath);
   const jsonFiles = allFiles.filter(file => file.startsWith('esg_annotation_') && file.endsWith('.json'));
-  const pdfFiles = allFiles.filter(file => file.endsWith('.pdf'));
 
   if (jsonFiles.length === 0) {
     console.log("在 'data' 資料夾中沒有找到任何 'esg_annotation_*.json' 檔案。");
@@ -31,31 +30,51 @@ async function main() {
     for (const jsonFileName of jsonFiles) {
       // 從 esg_annotation_fubon_2881.json 提取 fubon_2881
       const key = jsonFileName.replace('esg_annotation_', '').replace('.json', '');
-      const projectName = key; // 直接用 key 當專案名稱
+      const projectName = key;
 
       console.log(`\n--- 開始處理專案: ${projectName} ---`);
       
-      // 尋找對應的 PDF 檔案
-      const pdfFileName = pdfFiles.find(name => name.includes(key));
+      // 尋找對應的 PDF 資料夾（例如：fubon_2881_esg_report_2024）
+      const pdfFolderName = allFiles.find(name => {
+        const itemPath = path.join(dataFolderPath, name);
+        return fs.statSync(itemPath).isDirectory() && name.includes(key);
+      });
 
-      if (!pdfFileName) {
-        console.warn(`  > 警告：找不到與 ${key} 對應的 PDF 檔案，將不會上傳 PDF。`);
+      if (!pdfFolderName) {
+        console.warn(`  > 警告：找不到與 ${key} 對應的 PDF 資料夾，將不會上傳 PDF。`);
         await uploadData(client, projectName, jsonFileName, null);
       } else {
-        console.log(`  > 找到對應的 PDF: ${pdfFileName}`);
+        console.log(`  > 找到對應的 PDF 資料夾: ${pdfFolderName}`);
         
-        // 1. 上傳 PDF 到 Vercel Blob
-        const pdfFilePath = path.join(dataFolderPath, pdfFileName);
-        const pdfFileBuffer = fs.readFileSync(pdfFilePath);
+        // 上傳資料夾中所有的 PDF 檔案
+        const pdfFolderPath = path.join(dataFolderPath, pdfFolderName);
+        const pdfFiles = fs.readdirSync(pdfFolderPath).filter(f => f.endsWith('.pdf'));
         
-        console.log(`  > 正在上傳 ${pdfFileName} 到 Vercel Blob...`);
-        const blob = await put(pdfFileName, pdfFileBuffer, {
-          access: 'public',
-        });
-        console.log(`  > PDF 上傳成功！URL: ${blob.url}`);
-
-        // 2. 上傳 JSON 資料，並傳入 PDF 的 URL
-        await uploadData(client, projectName, jsonFileName, blob.url);
+        console.log(`  > 找到 ${pdfFiles.length} 個 PDF 檔案`);
+        
+        // 建立頁碼到 URL 的對應表
+        const pageUrlMap = {};
+        
+        for (const pdfFile of pdfFiles) {
+          // 從檔名提取頁碼 (例如: fubon_2881_esg_report_2024_page_1.pdf -> 1)
+          const pageMatch = pdfFile.match(/page_(\d+)\.pdf$/);
+          if (pageMatch) {
+            const pageNumber = parseInt(pageMatch[1], 10);
+            const pdfFilePath = path.join(pdfFolderPath, pdfFile);
+            const pdfFileBuffer = fs.readFileSync(pdfFilePath);
+            
+            console.log(`  > 正在上傳 ${pdfFile} 到 Vercel Blob...`);
+            const blob = await put(pdfFile, pdfFileBuffer, {
+              access: 'public',
+            });
+            
+            pageUrlMap[pageNumber] = blob.url;
+            console.log(`  > 第 ${pageNumber} 頁上傳成功`);
+          }
+        }
+        
+        // 上傳 JSON 資料，並傳入頁碼對應表
+        await uploadData(client, projectName, jsonFileName, pageUrlMap);
       }
     }
     console.log('\n所有檔案處理完畢！');
@@ -68,7 +87,7 @@ async function main() {
 }
 
 // --- 上傳單一 JSON 檔案的資料到資料庫 ---
-async function uploadData(client, projectName, jsonFileName, pdfUrl) {
+async function uploadData(client, projectName, jsonFileName, pageUrlMap) {
   const jsonFilePath = path.join(__dirname, '../data', jsonFileName);
   try {
     await client.query('BEGIN');
@@ -88,6 +107,8 @@ async function uploadData(client, projectName, jsonFileName, pdfUrl) {
     const jsonData = JSON.parse(rawData);
     
     let insertedCount = 0;
+    let skippedCount = 0;
+    
     for (const item of jsonData) {
         const exists = await client.query(
             `SELECT 1 FROM source_data WHERE project_id = $1 AND original_data = $2`,
@@ -96,17 +117,27 @@ async function uploadData(client, projectName, jsonFileName, pdfUrl) {
 
         if (exists.rows.length === 0) {
             const bbox = item.bbox || null;
-            // 插入資料時，直接寫入 pdfUrl
+            const pageNumber = item.page_number || 1;
+            
+            // 根據頁碼從對應表中找到對應的 PDF URL
+            const pdfUrl = pageUrlMap ? pageUrlMap[pageNumber] : null;
+            
+            if (!pdfUrl && pageUrlMap) {
+                console.warn(`  > 警告：找不到第 ${pageNumber} 頁的 PDF 檔案`);
+            }
+            
             await client.query(
                 `INSERT INTO source_data (project_id, original_data, source_url, page_number, bbox)
                  VALUES ($1, $2, $3, $4, $5)`,
-                [projectId, item.data, pdfUrl, item.page_number, bbox]
+                [projectId, item.data, pdfUrl, pageNumber, bbox]
             );
             insertedCount++;
+        } else {
+            skippedCount++;
         }
     }
     
-    console.log(`  > 資料庫處理完成: 總共 ${jsonData.length} 筆資料，新增了 ${insertedCount} 筆。`);
+    console.log(`  > 資料庫處理完成: 總共 ${jsonData.length} 筆資料，新增了 ${insertedCount} 筆，跳過 ${skippedCount} 筆。`);
     await client.query('COMMIT');
     
   } catch (error) {

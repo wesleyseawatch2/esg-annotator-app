@@ -2,27 +2,23 @@
 'use client';
 
 import { useState, useEffect, useRef } from 'react';
-import Link from 'next/link'; // 匯入 Link 元件
+import Link from 'next/link';
 import { 
   registerUser, 
   loginUser, 
   getProjectsWithProgress, 
-  getNextTaskForUser, 
-  saveAnnotation 
+  getNextTaskForUser,
+  getPreviousTaskForUser,
+  resetProjectAnnotations,
+  saveAnnotation
 } from './actions';
 import dynamic from 'next/dynamic';
 
-// 使用 next/dynamic 進行動態載入，並關閉 SSR
-// 這可以解決 'DOMMatrix is not defined' 的錯誤
 const PDFViewer = dynamic(() => import('../components/PDFViewer'), {
   ssr: false,
   loading: () => <div className="pdf-status">正在載入 PDF 瀏覽器...</div>
 });
 
-
-// --- 子元件 ---
-
-// 1. 登入/註冊畫面元件
 function LoginRegisterScreen({ onLoginSuccess }) {
   const [isLogin, setIsLogin] = useState(true);
   const [username, setUsername] = useState('');
@@ -70,7 +66,6 @@ function LoginRegisterScreen({ onLoginSuccess }) {
   );
 }
 
-// 2. 選擇專案畫面元件 (含管理後台連結)
 function ProjectSelectionScreen({ user, onProjectSelect, onLogout }) {
   const [projects, setProjects] = useState([]);
   useEffect(() => {
@@ -88,7 +83,6 @@ function ProjectSelectionScreen({ user, onProjectSelect, onLogout }) {
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px' }}>
             <h2>你好, {user.username}!</h2>
             <div>
-              {/* 如果是 admin，就顯示管理後台按鈕 */}
               {user.role === 'admin' && (
                 <Link href="/admin" className="btn btn-purple" style={{marginRight: '10px'}}>
                   管理後台
@@ -124,84 +118,123 @@ function ProjectSelectionScreen({ user, onProjectSelect, onLogout }) {
   );
 }
 
-// 3. 標註主畫面元件
 function AnnotationScreen({ user, project, onBack }) {
-    const [currentItem, setCurrentItem] = useState(undefined); // undefined: 載入中, null: 已完成, object: 有任務
-    const [progress, setProgress] = useState({ total: '?', completed: '?' });
-
+    const [currentItem, setCurrentItem] = useState(undefined);
+    const [progress, setProgress] = useState({ completed: 0, total: 0 });
     const [esgTypes, setEsgTypes] = useState([]);
     const [promiseStatus, setPromiseStatus] = useState('');
     const [verificationTimeline, setVerificationTimeline] = useState('');
     const [evidenceStatus, setEvidenceStatus] = useState('');
     const [evidenceQuality, setEvidenceQuality] = useState('');
-
     const dataTextRef = useRef(null);
 
-    const loadTask = async () => {
-        setCurrentItem(undefined); 
-        const progressData = await getProjectsWithProgress(user.id);
-        const currentProjectData = progressData.projects?.find(p => p.id === project.id);
-        if (currentProjectData) {
-            setProgress({ total: currentProjectData.total_tasks, completed: currentProjectData.completed_tasks });
-        }
+    useEffect(() => { loadTask(); }, []);
 
-        const taskData = await getNextTaskForUser(project.id, user.id);
-        if (taskData.error) {
-            alert("讀取任務失敗: " + taskData.error);
-            setCurrentItem(null);
+    const loadTask = async () => {
+        const taskRes = await getNextTaskForUser(project.id, user.id);
+        if (taskRes.task) {
+            setCurrentItem(taskRes.task);
+            loadTaskData(taskRes.task);
         } else {
-            setCurrentItem(taskData.task);
+            setCurrentItem(null);
+        }
+        
+        const projRes = await getProjectsWithProgress(user.id);
+        const proj = projRes.projects?.find(p => p.id === project.id);
+        if (proj) setProgress({ completed: proj.completed_tasks, total: proj.total_tasks });
+    };
+
+    const loadPreviousTask = async () => {
+        if (!currentItem) return;
+        const res = await getPreviousTaskForUser(project.id, user.id, currentItem.id);
+        if (res.task) {
+            setCurrentItem(res.task);
+            loadTaskData(res.task);
+        } else {
+            alert('沒有上一筆資料');
         }
     };
 
-    useEffect(() => { loadTask(); }, [project, user.id]);
+    const loadTaskData = (task) => {
+        if (dataTextRef.current) {
+            dataTextRef.current.innerHTML = task.original_data;
+        }
+        
+        // esg_type 現在是陣列格式，不需要 split
+        setEsgTypes(Array.isArray(task.esg_type) ? task.esg_type : (task.esg_type ? task.esg_type.split(',') : []));
+        setPromiseStatus(task.promise_status || '');
+        setVerificationTimeline(task.verification_timeline || '');
+        setEvidenceStatus(task.evidence_status || '');
+        setEvidenceQuality(task.evidence_quality || '');
+    };
 
-    useEffect(() => {
-        if (currentItem) {
-            setEsgTypes(currentItem.esg_type || []);
-            setPromiseStatus(currentItem.promise_status || '');
-            setVerificationTimeline(currentItem.verification_timeline || '');
-            setEvidenceStatus(currentItem.evidence_status || '');
-            setEvidenceQuality(currentItem.evidence_quality || '');
-            if (dataTextRef.current) {
-                dataTextRef.current.innerHTML = currentItem.original_data || '';
+    const handleResetProject = async () => {
+        if (window.confirm('確定要重置此專案嗎？將刪除您在此專案的所有標註記錄！')) {
+            const result = await resetProjectAnnotations(project.id, user.id);
+            if (result.success) {
+                alert('重置成功！');
+                loadTask();
+            } else {
+                alert(`重置失敗: ${result.error}`);
             }
         }
-    }, [currentItem]);
-    
+    };
+
     const handleSaveAndNext = async () => {
         if (!currentItem) return;
+        
+        if (!promiseStatus) return alert('請選擇承諾狀態');
+        if (promiseStatus === 'Yes') {
+            if (!verificationTimeline) return alert('請選擇驗證時間軸');
+            if (!evidenceStatus) return alert('請選擇證據狀態');
+            if (evidenceStatus === 'Yes' && !evidenceQuality) return alert('請選擇證據品質');
+        }
 
-        const dataToSave = {
+        const annotationData = {
             source_data_id: currentItem.id,
             user_id: user.id,
-            esg_type: esgTypes,
+            esg_type: esgTypes.join(','),
             promise_status: promiseStatus,
             promise_string: getHighlightedText('promise'),
             verification_timeline: verificationTimeline,
             evidence_status: evidenceStatus,
             evidence_string: getHighlightedText('evidence'),
-            evidence_quality: evidenceQuality,
+            evidence_quality: evidenceQuality
         };
-        const result = await saveAnnotation(dataToSave);
-        if (result.success) {
-            loadTask();
-        } else {
-            alert("儲存失敗: " + result.error);
+
+        const result = await saveAnnotation(annotationData);
+        if (!result.success) {
+            alert(`儲存失敗: ${result.error}`);
+            return;
         }
+
+        clearAllHighlights();
+        setEsgTypes([]);
+        setPromiseStatus('');
+        setVerificationTimeline('');
+        setEvidenceStatus('');
+        setEvidenceQuality('');
+        
+        await loadTask();
     };
 
     const highlightSelection = (type) => {
         const selection = window.getSelection();
         if (!selection.rangeCount || selection.isCollapsed) return;
+        
         const range = selection.getRangeAt(0);
+        const container = dataTextRef.current;
+        if (!container.contains(range.commonAncestorContainer)) return;
+        
         const span = document.createElement('span');
         span.className = `highlight-${type}`;
+        
         try {
             range.surroundContents(span);
-        } catch (e) {
-            alert('無法標記跨越不同區塊的文字');
+        } catch (err) {
+            console.warn('無法標記選取範圍:', err);
         }
+        
         selection.removeAllRanges();
     };
 
@@ -229,13 +262,32 @@ function AnnotationScreen({ user, project, onBack }) {
                 <h1>{project.name} - 標註工具</h1>
                 <div className="controls">
                     <button onClick={onBack} className="btn">返回專案列表</button>
+                    <button 
+                        onClick={handleResetProject} 
+                        className="btn"
+                        style={{
+                            background: '#dc2626', 
+                            color: 'white',
+                            marginLeft: '10px'
+                        }}
+                    >
+                        🔄 重置專案
+                    </button>
                     <span style={{ marginLeft: 'auto', fontWeight: 'bold' }}>標註者: {user.username}</span>
                 </div>
                 <div className="progress">
                     <span>您的個人進度: {progress.completed} / {progress.total}</span>
                     <div className="nav-btns">
                         <button 
-                            className="nav-btn btn-emerald" // 將 btn-success 改為 btn-emerald
+                            className="btn"
+                            onClick={loadPreviousTask}
+                            disabled={!currentItem}
+                            style={{marginRight: '10px'}}
+                        >
+                            ← 上一筆
+                        </button>
+                        <button 
+                            className="nav-btn btn-emerald"
                             onClick={handleSaveAndNext} 
                             disabled={!currentItem}
                         >
@@ -251,7 +303,7 @@ function AnnotationScreen({ user, project, onBack }) {
                 <div className="content">
                     <div className="content-top">
                         <div className="panel">
-                            <h2>文本內容 (ID: {currentItem.id})</h2>
+                            <h2>文本內容 (ID: {currentItem.id}, 頁碼: {currentItem.page_number})</h2>
                             <div className="info-box">用滑鼠選取文字後點擊下方按鈕: 黃色=承諾 / 藍色=證據</div>
                             <div ref={dataTextRef} className="text-area"></div>
                             <div className="highlight-btns">
@@ -329,7 +381,6 @@ function AnnotationScreen({ user, project, onBack }) {
     );
 }
 
-// --- 主頁面元件，用於控制流程 ---
 export default function HomePage() {
   const [user, setUser] = useState(null);
   const [selectedProject, setSelectedProject] = useState(null);

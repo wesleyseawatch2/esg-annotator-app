@@ -1,109 +1,276 @@
 // 檔案路徑: app/adminActions.js
 'use server';
-
 import { sql } from '@vercel/postgres';
-import { put } from '@vercel/blob';
 import { revalidatePath } from 'next/cache';
 
-// 輔助函式：檢查使用者是否為管理員
-async function verifyAdmin(userId) {
-    if (!userId) throw new Error('未登入或缺少使用者 ID');
-    const { rows } = await sql`SELECT role FROM users WHERE id = ${userId}`;
-    if (rows.length === 0 || rows[0].role !== 'admin') {
-        throw new Error('權限不足，此操作僅限管理員');
-    }
-}
-
-export async function updateProjectOffset(userId, projectId, offset) {
-    try {
-        await verifyAdmin(userId); // 權限檢查
-        const newOffset = parseInt(offset, 10) || 0;
-        await sql`UPDATE projects SET page_offset = ${newOffset} WHERE id = ${projectId};`;
-        revalidatePath('/admin');
-        return { success: true };
-    } catch (error) {
-        return { success: false, error: error.message };
-    }
-}
-
-// 刪除專案 (會一併刪除關聯的所有資料和標註，因為資料庫設定了 ON DELETE CASCADE)
+// --- 刪除專案 ---
 export async function deleteProject(userId, projectId) {
-    try {
-        await verifyAdmin(userId); // 權限檢查
-        
-        console.log(`管理員 ${userId} 正在刪除專案 ${projectId}`);
-        await sql`DELETE FROM projects WHERE id = ${projectId};`;
-        
-        revalidatePath('/admin'); // 清除快取，讓管理頁面重新整理
-        return { success: true };
-    } catch (error) {
-        console.error('刪除專案失敗:', error);
-        return { success: false, error: error.message };
+  try {
+    const { rows: userRows } = await sql`SELECT role FROM users WHERE id = ${userId};`;
+    if (userRows.length === 0 || userRows[0].role !== 'admin') {
+      return { success: false, error: '權限不足' };
     }
+
+    await sql`DELETE FROM annotations WHERE source_data_id IN (SELECT id FROM source_data WHERE project_id = ${projectId});`;
+    await sql`DELETE FROM source_data WHERE project_id = ${projectId};`;
+    await sql`DELETE FROM projects WHERE id = ${projectId};`;
+    
+    revalidatePath('/admin');
+    return { success: true };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
 }
 
-// 整合 JSON 和 PDF 的上傳功能
-export async function uploadProjectFiles(userId, formData) {
-    try {
-        await verifyAdmin(userId); // 權限檢查
-
-        const jsonFile = formData.get('jsonFile');
-        const pdfFile = formData.get('pdfFile');
-        if (!jsonFile || !pdfFile) {
-            throw new Error('必須同時提供 JSON 和 PDF 檔案');
-        }
-
-        const projectName = jsonFile.name.replace('esg_annotation_', '').replace('.json', '');
-        if(pdfFile.name.indexOf(projectName) === -1) {
-            throw new Error('PDF 檔名與 JSON 檔名不匹配！');
-        }
-
-        // 1. 上傳 PDF 到 Vercel Blob
-        const blob = await put(pdfFile.name, pdfFile, {
-        access: 'public',
-        allowOverwrite: true, // <-- 新增這一行
-        });
-
-        // 2. 處理 JSON 並寫入資料庫
-        const client = await sql.connect();
-        try {
-            await client.query('BEGIN');
-
-            let projectResult = await client.query('SELECT id FROM projects WHERE name = $1', [projectName]);
-            let projectId;
-            if (projectResult.rows.length === 0) {
-                projectResult = await client.query('INSERT INTO projects (name) VALUES ($1) RETURNING id', [projectName]);
-                projectId = projectResult.rows[0].id;
-            } else {
-                projectId = projectResult.rows[0].id;
-            }
-
-            const jsonText = await jsonFile.text();
-            const jsonData = JSON.parse(jsonText);
-            
-            for (const item of jsonData) {
-                const bbox = item.bbox || null;
-                await client.query(
-                    `INSERT INTO source_data (project_id, original_data, source_url, page_number, bbox)
-                     VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING`,
-                    [projectId, item.data, blob.url, item.page_number, bbox]
-                );
-            }
-            
-            await client.query('COMMIT');
-        } catch (e) {
-            await client.query('ROLLBACK');
-            throw e; // 拋出錯誤，讓外層 catch 捕捉
-        } finally {
-            client.release();
-        }
-
-        revalidatePath('/admin');
-        revalidatePath('/');
-        return { success: true };
-
-    } catch (error) {
-        console.error('上傳專案檔案失敗:', error);
-        return { success: false, error: error.message };
+export async function saveProjectData(userId, { projectName, jsonData, pageUrlMap, startPage = 1 }) {
+  try {
+    const { rows: userRows } = await sql`SELECT role FROM users WHERE id = ${userId};`;
+    if (userRows.length === 0 || userRows[0].role !== 'admin') {
+      return { success: false, error: '權限不足' };
     }
+
+    // startPage 是用戶指定的「JSON page_number:1 對應到哪個 PDF」
+    // offset = startPage - 1
+    const pageOffset = startPage - 1;
+
+    let projectResult = await sql`SELECT id FROM projects WHERE name = ${projectName};`;
+    let projectId;
+    
+    if (projectResult.rows.length === 0) {
+      projectResult = await sql`
+        INSERT INTO projects (name, page_offset, pdf_urls) 
+        VALUES (${projectName}, ${pageOffset}, ${JSON.stringify(pageUrlMap)}) 
+        RETURNING id;
+      `;
+      projectId = projectResult.rows[0].id;
+    } else {
+      projectId = projectResult.rows[0].id;
+      await sql`
+        UPDATE projects 
+        SET page_offset = ${pageOffset}, pdf_urls = ${JSON.stringify(pageUrlMap)}
+        WHERE id = ${projectId};
+      `;
+    }
+
+    let insertedCount = 0;
+    let matchedCount = 0;
+    
+    for (const item of jsonData) {
+      const existingRows = await sql`
+        SELECT 1 FROM source_data 
+        WHERE project_id = ${projectId} AND original_data = ${item.data};
+      `;
+      
+      if (existingRows.rows.length === 0) {
+        const bbox = item.bbox || null;
+        const pageNumber = item.page_number || 1;
+        const actualPdfPage = pageNumber + pageOffset;
+        const pdfUrl = pageUrlMap[actualPdfPage] || null;
+        
+        await sql`
+          INSERT INTO source_data (project_id, original_data, source_url, page_number, bbox)
+          VALUES (${projectId}, ${item.data}, ${pdfUrl}, ${pageNumber}, ${bbox});
+        `;
+        insertedCount++;
+        if (pdfUrl) matchedCount++;
+      }
+    }
+
+    revalidatePath('/');
+    revalidatePath('/admin');
+    
+    return { 
+      success: true, 
+      message: `匯入 ${insertedCount} 筆，成功對應 ${matchedCount} 個 PDF (offset: ${pageOffset})` 
+    };
+    
+  } catch (error) {
+    console.error('儲存資料失敗:', error);
+    return { success: false, error: error.message };
+  }
+}
+
+// --- 更新專案的 page_offset ---
+export async function updateProjectOffset(userId, projectId, newOffset) {
+  try {
+    const { rows: userRows } = await sql`SELECT role FROM users WHERE id = ${userId};`;
+    if (userRows.length === 0 || userRows[0].role !== 'admin') {
+      return { success: false, error: '權限不足' };
+    }
+
+    // 從 projects 表取得完整的 PDF URLs
+    const { rows: projectRows } = await sql`
+      SELECT pdf_urls FROM projects WHERE id = ${projectId};
+    `;
+
+    if (projectRows.length === 0) {
+      return { success: false, error: '找不到專案' };
+    }
+
+    const pageUrlMap = projectRows[0].pdf_urls || {};
+    
+    if (Object.keys(pageUrlMap).length === 0) {
+      return { success: false, error: '此專案沒有 PDF 資料，請重新上傳' };
+    }
+
+    // 取得所有 source_data
+    const { rows: sourceData } = await sql`
+      SELECT id, page_number
+      FROM source_data 
+      WHERE project_id = ${projectId}
+      ORDER BY id;
+    `;
+
+    // 更新 offset
+    await sql`UPDATE projects SET page_offset = ${newOffset} WHERE id = ${projectId};`;
+
+    // 重新對應所有 PDF URLs
+    let updatedCount = 0;
+    for (const item of sourceData) {
+      const actualPdfPage = item.page_number + newOffset;
+      const newUrl = pageUrlMap[actualPdfPage] || null;
+      
+      await sql`
+        UPDATE source_data 
+        SET source_url = ${newUrl}
+        WHERE id = ${item.id};
+      `;
+      
+      if (newUrl) updatedCount++;
+    }
+    
+    revalidatePath('/');
+    revalidatePath('/admin');
+    return { 
+      success: true, 
+      message: `已更新 ${updatedCount}/${sourceData.length} 筆資料的 PDF 對應` 
+    };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+}
+
+// --- 修復專案的 PDF URLs ---
+export async function repairProjectPdfs(userId, projectId) {
+  try {
+    const { rows: userRows } = await sql`SELECT role FROM users WHERE id = ${userId};`;
+    if (userRows.length === 0 || userRows[0].role !== 'admin') {
+      return { success: false, error: '權限不足' };
+    }
+
+    // 收集所有現有的 PDF URLs
+    const { rows: sourceData } = await sql`
+      SELECT DISTINCT source_url 
+      FROM source_data 
+      WHERE project_id = ${projectId} AND source_url IS NOT NULL;
+    `;
+
+    const pageUrlMap = {};
+    for (const item of sourceData) {
+      // 改用更寬鬆的正則，匹配 _page_數字.pdf
+      const match = item.source_url.match(/_page_(\d+)\.pdf$/i);
+      if (match) {
+        const pdfPageNum = parseInt(match[1], 10);
+        pageUrlMap[pdfPageNum] = item.source_url;
+      }
+    }
+
+    if (Object.keys(pageUrlMap).length === 0) {
+      return { success: false, error: '找不到任何 PDF，請刪除專案重新上傳' };
+    }
+
+    // 儲存到 projects
+    await sql`
+      UPDATE projects 
+      SET pdf_urls = ${JSON.stringify(pageUrlMap)}
+      WHERE id = ${projectId};
+    `;
+
+    // 取得當前 offset 並重新對應
+    const { rows: projectRows } = await sql`
+      SELECT page_offset FROM projects WHERE id = ${projectId};
+    `;
+    const currentOffset = projectRows[0]?.page_offset || 0;
+
+    const { rows: allSourceData } = await sql`
+      SELECT id, page_number FROM source_data WHERE project_id = ${projectId};
+    `;
+
+    let updatedCount = 0;
+    for (const item of allSourceData) {
+      const actualPdfPage = item.page_number + currentOffset;
+      const newUrl = pageUrlMap[actualPdfPage] || null;
+      
+      await sql`
+        UPDATE source_data 
+        SET source_url = ${newUrl}
+        WHERE id = ${item.id};
+      `;
+      
+      if (newUrl) updatedCount++;
+    }
+
+    revalidatePath('/');
+    revalidatePath('/admin');
+    return { 
+      success: true, 
+      message: `已修復並對應 ${updatedCount}/${allSourceData.length} 筆 PDF（收集到 ${Object.keys(pageUrlMap).length} 個 PDF）` 
+    };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+}
+
+// --- 診斷專案 PDF 設定 ---
+export async function diagnoseProject(userId, projectId) {
+  try {
+    const { rows: userRows } = await sql`SELECT role FROM users WHERE id = ${userId};`;
+    if (userRows.length === 0 || userRows[0].role !== 'admin') {
+      return { success: false, error: '權限不足' };
+    }
+
+    const { rows: projectRows } = await sql`
+      SELECT id, name, page_offset, pdf_urls FROM projects WHERE id = ${projectId};
+    `;
+
+    if (projectRows.length === 0) {
+      return { success: false, error: '找不到專案' };
+    }
+
+    const project = projectRows[0];
+
+    const { rows: sourceData } = await sql`
+      SELECT id, page_number, source_url 
+      FROM source_data 
+      WHERE project_id = ${projectId}
+      ORDER BY id
+      LIMIT 5;
+    `;
+
+    const { rows: stats } = await sql`
+      SELECT 
+        COUNT(*) as total,
+        COUNT(source_url) as has_url,
+        COUNT(*) - COUNT(source_url) as no_url
+      FROM source_data 
+      WHERE project_id = ${projectId};
+    `;
+
+    return {
+      success: true,
+      data: {
+        project: {
+          id: project.id,
+          name: project.name,
+          page_offset: project.page_offset,
+          pdf_urls_count: project.pdf_urls ? Object.keys(project.pdf_urls).length : 0,
+          pdf_urls: project.pdf_urls
+        },
+        stats: stats[0],
+        sample_data: sourceData
+      }
+    };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
 }

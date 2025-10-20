@@ -4,21 +4,22 @@
 import { useState, useEffect, useRef } from 'react';
 import * as pdfjsLib from 'pdfjs-dist';
 
-// 設定 workerSrc 指向 public 資料夾中的檔案
 pdfjsLib.GlobalWorkerOptions.workerSrc = '/pdf.worker.min.mjs';
 
 export default function PDFViewer({ pdfUrl, pageNumber, bbox }) {
     const canvasRef = useRef(null);
+    const containerRef = useRef(null);
     const [pdfDoc, setPdfDoc] = useState(null);
     const [currentPage, setCurrentPage] = useState(pageNumber || 1);
     const [scale, setScale] = useState(1.5);
     const [pageInfo, setPageInfo] = useState('');
     const [isLoading, setIsLoading] = useState(true);
     const [error, setError] = useState('');
+    const [pageHeight, setPageHeight] = useState(0);
 
     useEffect(() => {
         if (!pdfUrl) {
-            setError('沒有提供 PDF 網址。請檢查資料庫 source_url 欄位。');
+            setError('沒有提供 PDF 網址');
             setIsLoading(false);
             return;
         }
@@ -52,35 +53,52 @@ export default function PDFViewer({ pdfUrl, pageNumber, bbox }) {
             const canvas = canvasRef.current;
             if (!canvas) return;
 
+            const pageViewport = page.getViewport({ scale: 1 });
+            setPageHeight(pageViewport.height);
+
             const context = canvas.getContext('2d');
             canvas.height = viewport.height;
             canvas.width = viewport.width;
 
-            await page.render({ canvasContext: context, viewport: viewport }).promise;
+            if (canvas._renderTask) {
+                canvas._renderTask.cancel();
+            }
+
+            const renderTask = page.render({ canvasContext: context, viewport: viewport });
+            canvas._renderTask = renderTask;
+            
+            await renderTask.promise;
+            canvas._renderTask = null;
+            
             setPageInfo(`頁碼: ${pageNum} / ${pdfDoc.numPages}`);
         } catch (err) {
-            console.error("渲染頁面失敗:", err);
+            if (err.name === 'RenderingCancelledException') {
+                return;
+            }
+            console.error("渲染失敗:", err);
             setError(`渲染頁面 ${pageNum} 失敗`);
         }
     };
     
     const drawBoundingBox = () => {
         const canvas = canvasRef.current;
-        if (!canvas || !bbox || bbox.length !== 4) return null;
+        if (!canvas || !bbox || bbox.length !== 4 || !pageHeight) return null;
 
-        const viewport = { width: canvas.width, height: canvas.height };
-        // PDF.js 的 y 軸是從下往上，所以需要轉換
-        const pageHeightInPoints = pdfDoc.getPage(currentPage).then(p => p.getViewport({scale: 1}).height);
-        
         const [x0, y0, x1, y1] = bbox;
+        
         const style = {
             position: 'absolute',
             left: `${x0 * scale}px`,
-            top: `${(viewport.height / scale - y1) * scale}px`, // 座標轉換
+            top: `${(pageHeight - y1) * scale}px`,
             width: `${(x1 - x0) * scale}px`,
             height: `${(y1 - y0) * scale}px`,
+            border: '2px solid #ff0000',
+            backgroundColor: 'rgba(255, 255, 0, 0.2)',
+            pointerEvents: 'none',
+            boxSizing: 'border-box'
         };
-        return <div className="text-highlight-overlay" style={style}></div>;
+        
+        return <div style={style}></div>;
     };
 
     const changePage = (offset) => {
@@ -103,7 +121,7 @@ export default function PDFViewer({ pdfUrl, pageNumber, bbox }) {
                 <label>📄 原始 PDF 文件</label>
             </div>
             <div className="collapsible-content">
-                {isLoading && <div className="pdf-status">正在載入 PDF...</div>}
+                {isLoading && <div className="pdf-status">載入中...</div>}
                 {error && <div className="pdf-status" style={{background: '#fecaca', color: '#b91c1c'}}>{error}</div>}
                 {pdfDoc && !error && (
                     <>
@@ -114,7 +132,7 @@ export default function PDFViewer({ pdfUrl, pageNumber, bbox }) {
                             <button onClick={() => changeZoom(0.2)}>放大</button>
                             <button onClick={() => changeZoom(-0.2)}>縮小</button>
                         </div>
-                        <div id="pdfContainer">
+                        <div id="pdfContainer" ref={containerRef} style={{ position: 'relative', display: 'inline-block' }}>
                             <canvas ref={canvasRef}></canvas>
                             {drawBoundingBox()}
                         </div>

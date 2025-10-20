@@ -1,24 +1,27 @@
+// 檔案路徑: app/admin/page.js
 'use client';
 
 import { useState, useEffect, useRef } from 'react';
 import { getProjectsWithProgress } from '../actions';
-import { deleteProject, uploadProjectFiles, updateProjectOffset } from '../adminActions';
+import { deleteProject, saveProjectData, updateProjectOffset, repairProjectPdfs, diagnoseProject } from '../adminActions';
 import { useRouter } from 'next/navigation';
+import { upload } from '@vercel/blob/client';
 
 export default function AdminPage() {
     const [user, setUser] = useState(null);
     const [projects, setProjects] = useState([]);
     const [message, setMessage] = useState('');
     const [isUploading, setIsUploading] = useState(false);
+    const [uploadProgress, setUploadProgress] = useState('');
+    const [selectedFiles, setSelectedFiles] = useState({ json: null, pdfs: [] });
+    const [startPage, setStartPage] = useState(10);
     const formRef = useRef(null);
     const router = useRouter();
 
-    // 權限檢查與載入專案
     useEffect(() => {
         const savedUser = localStorage.getItem('annotatorUser');
         if (savedUser) {
             const parsedUser = JSON.parse(savedUser);
-            // 檢查是否為管理員
             if (parsedUser.role !== 'admin') {
                 alert('權限不足，將返回主頁面');
                 router.push('/');
@@ -32,14 +35,11 @@ export default function AdminPage() {
         }
     }, [router]);
 
-    // 載入專案列表和進度
     const loadProjects = async (userId) => {
-        // getProjectsWithProgress 會回傳 page_offset
         const data = await getProjectsWithProgress(userId); 
         if(data.projects) setProjects(data.projects);
     };
 
-    // 處理專案刪除
     const handleDelete = async (projectId) => {
         if (window.confirm('確定要刪除這個專案嗎？這將永久移除所有相關資料！')) {
             const result = await deleteProject(user.id, projectId);
@@ -52,90 +52,265 @@ export default function AdminPage() {
         }
     };
 
-    // 處理檔案上傳
+    const handleUpdateOffset = async (projectId, newStartPage) => {
+        const parsed = parseInt(newStartPage, 10);
+        if (isNaN(parsed) || parsed < 1) {
+            alert('請輸入有效的頁碼（≥1）');
+            loadProjects(user.id);
+            return;
+        }
+
+        const offset = parsed - 1;
+        const result = await updateProjectOffset(user.id, projectId, offset);
+        
+        if (result.success) {
+            if (result.message) {
+                alert(result.message);
+            }
+            setProjects(prevProjects => prevProjects.map(p => 
+                p.id === projectId ? { ...p, page_offset: offset } : p
+            ));
+        } else {
+            alert(`更新失敗: ${result.error}`);
+            loadProjects(user.id);
+        }
+    };
+
+    const handleRepairPdfs = async (projectId) => {
+        if (window.confirm('確定要修復此專案的 PDF 對應嗎？')) {
+            const result = await repairProjectPdfs(user.id, projectId);
+            if (result.success) {
+                alert(result.message || '修復成功！');
+                loadProjects(user.id);
+            } else {
+                alert(`修復失敗: ${result.error}`);
+            }
+        }
+    };
+
+    const handleDiagnose = async (projectId) => {
+        const result = await diagnoseProject(user.id, projectId);
+        if (result.success) {
+            const d = result.data;
+            const pdfPages = d.project.pdf_urls ? Object.keys(d.project.pdf_urls).map(Number).sort((a,b) => a-b) : [];
+            const minPage = pdfPages.length > 0 ? Math.min(...pdfPages) : 0;
+            const maxPage = pdfPages.length > 0 ? Math.max(...pdfPages) : 0;
+            
+            const info = `
+═══════════════════════════════════
+專案診斷報告
+═══════════════════════════════════
+
+【專案資訊】
+名稱: ${d.project.name}
+Page Offset: ${d.project.page_offset}
+PDF URLs 數量: ${d.project.pdf_urls_count}
+
+【PDF 頁碼範圍】
+最小頁: ${minPage}
+最大頁: ${maxPage}
+範圍: ${minPage} ~ ${maxPage}
+
+【統計】
+總資料: ${d.stats.total}
+有 URL: ${d.stats.has_url}
+無 URL: ${d.stats.no_url}
+
+【前 5 筆資料】
+${d.sample_data.map(item => 
+  `ID: ${item.id}, page_number: ${item.page_number}, 需要 PDF page: ${item.page_number + (d.project.page_offset || 0)}, URL: ${item.source_url ? '✓' : '✗'}`
+).join('\n')}
+
+【建議】
+若要讓 page_number=1 對應到 page_${minPage}.pdf
+請設定「報告起始頁」= ${minPage}
+            `;
+            alert(info);
+        } else {
+            alert(`診斷失敗: ${result.error}`);
+        }
+    };
+
+    const handleJsonChange = (e) => {
+        const file = e.target.files[0];
+        setSelectedFiles(prev => ({ ...prev, json: file }));
+    };
+
+    const handlePdfFolderChange = (e) => {
+        const files = Array.from(e.target.files).filter(f => f.name.endsWith('.pdf'));
+        setSelectedFiles(prev => ({ ...prev, pdfs: files }));
+        setMessage(`已選擇 ${files.length} 個 PDF 檔案`);
+    };
+
     const handleUpload = async (event) => {
         event.preventDefault();
         if (!user) return;
 
-        const formData = new FormData(formRef.current);
-        
-        setIsUploading(true);
-        setMessage('正在上傳檔案與處理資料，請稍候...');
-
-        const result = await uploadProjectFiles(user.id, formData);
-        
-        setIsUploading(false);
-        if (result.success) {
-            setMessage('專案檔案上傳與資料匯入成功！');
-            formRef.current.reset();
-            loadProjects(user.id);
-        } else {
-            setMessage(`上傳失敗: ${result.error}`);
-        }
-    };
-
-    // 處理頁碼偏移量變更（失去焦點時觸發）
-    const handleOffsetChange = async (projectId, newOffset) => {
-        if (!user) return;
-        
-        // 確保 newOffset 是有效的數字
-        const parsedOffset = parseInt(newOffset, 10);
-        if (isNaN(parsedOffset) || parsedOffset < 0) {
-            alert('偏移量必須是零或正整數！');
-            loadProjects(user.id); // 重新載入以恢復舊值
+        if (!selectedFiles.json) {
+            setMessage('請選擇 JSON 檔案');
             return;
         }
 
-        const result = await updateProjectOffset(user.id, projectId, parsedOffset);
-        if (!result.success) {
-            alert(`更新失敗: ${result.error}`);
-        } else {
-            // 為了讓畫面立即反應，手動更新 state
-            setProjects(prevProjects => prevProjects.map(p => 
-                p.id === projectId ? { ...p, page_offset: parsedOffset } : p
-            ));
-            // 不需要特別顯示成功訊息，因為 onBlur 會一直觸發
+        if (selectedFiles.pdfs.length === 0) {
+            setMessage('請選擇包含 PDF 的資料夾');
+            return;
+        }
+
+        setIsUploading(true);
+        setMessage('');
+        
+        try {
+            const jsonText = await selectedFiles.json.text();
+            const jsonData = JSON.parse(jsonText);
+            
+            setUploadProgress(`正在上傳 ${selectedFiles.pdfs.length} 個 PDF...`);
+            const pageUrlMap = {};
+            
+            for (let i = 0; i < selectedFiles.pdfs.length; i++) {
+                const pdfFile = selectedFiles.pdfs[i];
+                const pageMatch = pdfFile.name.match(/page_(\d+)\.pdf$/);
+                
+                if (pageMatch) {
+                    const pageNumber = parseInt(pageMatch[1], 10);
+                    setUploadProgress(`上傳: ${i + 1}/${selectedFiles.pdfs.length} - ${pdfFile.name}`);
+                    
+                    const blob = await upload(pdfFile.name, pdfFile, {
+                        access: 'public',
+                        handleUploadUrl: '/api/upload',
+                    });
+                    
+                    pageUrlMap[pageNumber] = blob.url;
+                }
+            }
+            
+            setUploadProgress('儲存資料到資料庫...');
+            const projectName = selectedFiles.json.name.replace('esg_annotation_', '').replace('.json', '');
+            
+            const result = await saveProjectData(user.id, {
+                projectName,
+                jsonData,
+                pageUrlMap,
+                startPage
+            });
+            
+            setIsUploading(false);
+            setUploadProgress('');
+            
+            if (result.success) {
+                setMessage(result.message || '上傳成功！');
+                setSelectedFiles({ json: null, pdfs: [] });
+                setStartPage(10);
+                formRef.current.reset();
+                await loadProjects(user.id);
+            } else {
+                setMessage(`失敗: ${result.error}`);
+            }
+        } catch (error) {
+            setIsUploading(false);
+            setUploadProgress('');
+            setMessage(`錯誤: ${error.message}`);
+            console.error('Upload error:', error);
         }
     };
 
-    if (!user) return <div className="container"><h1>驗證權限中...</h1></div>;
+    if (!user) return <div className="container"><h1>驗證中...</h1></div>;
 
     return (
         <div className="container">
             <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px'}}>
                 <h1>管理員後台</h1>
-                <button className="btn" onClick={() => router.push('/')}>返回標註頁面</button>
+                <button className="btn" onClick={() => router.push('/')}>返回標註</button>
             </div>
 
-            {/* 上傳新專案區塊 */}
             <div className="panel">
                 <h2>上傳新專案</h2>
-                <p className="hint">請同時選擇 JSON 資料檔和對應的 PDF 報告檔。系統會根據檔名自動建立或更新專案。</p>
+                <p className="hint">
+                    JSON 格式：esg_annotation_專案名.json<br/>
+                    PDF 檔名：專案名_page_X.pdf
+                </p>
                 <form ref={formRef} onSubmit={handleUpload} style={{ marginTop: '15px' }}>
                     <div className="field">
-                        <label>JSON 資料檔 (esg_annotation_*.json)</label>
-                        <input name="jsonFile" type="file" accept=".json" required disabled={isUploading} />
+                        <label>JSON 資料檔</label>
+                        <input 
+                            type="file" 
+                            accept=".json" 
+                            onChange={handleJsonChange}
+                            required 
+                            disabled={isUploading} 
+                        />
+                        {selectedFiles.json && (
+                            <p className="hint" style={{marginTop: '5px', color: 'green'}}>
+                                ✓ {selectedFiles.json.name}
+                            </p>
+                        )}
                     </div>
+                    
                     <div className="field">
-                        <label>PDF 報告檔</label>
-                        <input name="pdfFile" type="file" accept=".pdf" required disabled={isUploading} />
+                        <label>PDF 資料夾</label>
+                        <input 
+                            type="file" 
+                            webkitdirectory="true"
+                            directory="true"
+                            multiple
+                            onChange={handlePdfFolderChange}
+                            required 
+                            disabled={isUploading} 
+                        />
+                        {selectedFiles.pdfs.length > 0 && (
+                            <p className="hint" style={{marginTop: '5px', color: 'green'}}>
+                                ✓ {selectedFiles.pdfs.length} 個 PDF
+                            </p>
+                        )}
                     </div>
+
+                    <div className="field">
+                        <label>JSON 第 1 頁對應到哪個 PDF？</label>
+                        <input 
+                            type="number" 
+                            min="1"
+                            value={startPage}
+                            onChange={(e) => setStartPage(parseInt(e.target.value) || 1)}
+                            disabled={isUploading}
+                            style={{
+                                width: '100px',
+                                padding: '8px',
+                                border: '1px solid #ccc',
+                                borderRadius: '4px'
+                            }}
+                        />
+                        <p className="hint" style={{marginTop: '5px'}}>
+                            例如：JSON page_number=1 要看 page_10.pdf，請輸入 10
+                        </p>
+                    </div>
+                    
                     <button type="submit" className="btn btn-success" disabled={isUploading}>
                         {isUploading ? '上傳中...' : '上傳專案'}
                     </button>
-                    {message && <p className="hint" style={{color: message.includes('失敗') ? 'red' : 'green', marginTop: '10px'}}>{message}</p>}
+                    
+                    {uploadProgress && (
+                        <p className="hint" style={{marginTop: '10px', color: 'blue'}}>
+                            {uploadProgress}
+                        </p>
+                    )}
+                    {message && (
+                        <p className="hint" style={{
+                            marginTop: '10px',
+                            color: message.includes('失敗') || message.includes('錯誤') ? 'red' : 'green'
+                        }}>
+                            {message}
+                        </p>
+                    )}
                 </form>
             </div>
             
-            {/* 專案列表區塊 */}
             <div className="panel" style={{marginTop: '20px'}}>
                 <h2>專案列表</h2>
                 <table style={{width: '100%', borderCollapse: 'collapse'}}>
                     <thead>
                         <tr style={{borderBottom: '1px solid #ddd'}}>
                             <th style={{textAlign: 'left', padding: '8px'}}>專案名稱</th>
-                            <th style={{textAlign: 'left', padding: '8px'}}>總任務數</th>
-                            <th style={{textAlign: 'center', padding: '8px'}}>要跳過幾頁</th>
+                            <th style={{textAlign: 'left', padding: '8px'}}>總任務</th>
+                            <th style={{textAlign: 'center', padding: '8px'}}>報告起始頁</th>
                             <th style={{textAlign: 'left', padding: '8px'}}>操作</th>
                         </tr>
                     </thead>
@@ -144,25 +319,66 @@ export default function AdminPage() {
                             <tr key={p.id} style={{borderBottom: '1px solid #eee'}}>
                                 <td style={{padding: '8px'}}>{p.name}</td>
                                 <td style={{padding: '8px'}}>{p.total_tasks}</td>
-                                {/* 頁碼偏移量輸入框 */}
                                 <td style={{padding: '8px', textAlign: 'center'}}>
                                     <input 
                                         type="number"
-                                        // 確保我們使用從後端接收到的 page_offset
-                                        defaultValue={p.page_offset || 0}
-                                        onBlur={(e) => handleOffsetChange(p.id, e.target.value)}
-                                        style={{width: '60px', padding: '4px', textAlign: 'center', border: '1px solid #ccc', borderRadius: '4px'}}
-                                        min="0"
+                                        defaultValue={p.page_offset !== null && p.page_offset !== undefined ? (p.page_offset + 1) : 1}
+                                        onBlur={(e) => handleUpdateOffset(p.id, e.target.value)}
+                                        style={{
+                                            width: '60px', 
+                                            padding: '4px', 
+                                            textAlign: 'center', 
+                                            border: '1px solid #ccc', 
+                                            borderRadius: '4px'
+                                        }}
+                                        min="1"
                                     />
                                 </td>
                                 <td style={{padding: '8px'}}>
-                                    <button className="btn highlight-btn-clear" onClick={() => handleDelete(p.id)}>刪除</button>
+                                    <button 
+                                        className="btn" 
+                                        onClick={() => handleDiagnose(p.id)}
+                                        style={{
+                                            background: '#8b5cf6',
+                                            color: 'white',
+                                            marginRight: '10px',
+                                            fontSize: '12px',
+                                            padding: '6px 12px'
+                                        }}
+                                    >
+                                        診斷
+                                    </button>
+                                    <button 
+                                        className="btn" 
+                                        onClick={() => handleRepairPdfs(p.id)}
+                                        style={{
+                                            background: '#3b82f6',
+                                            color: 'white',
+                                            marginRight: '10px',
+                                            fontSize: '12px',
+                                            padding: '6px 12px'
+                                        }}
+                                    >
+                                        修復
+                                    </button>
+                                    <button 
+                                        className="btn highlight-btn-clear" 
+                                        onClick={() => handleDelete(p.id)}
+                                        style={{
+                                            fontSize: '12px',
+                                            padding: '6px 12px'
+                                        }}
+                                    >
+                                        刪除
+                                    </button>
                                 </td>
                             </tr>
                         ))}
                     </tbody>
                 </table>
-                {projects.length === 0 && <p style={{padding: '15px', textAlign: 'center'}}>沒有可管理的專案。</p>}
+                {projects.length === 0 && (
+                    <p style={{padding: '15px', textAlign: 'center'}}>沒有專案</p>
+                )}
             </div>
         </div>
     );
